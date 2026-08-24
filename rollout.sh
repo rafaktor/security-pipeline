@@ -57,6 +57,7 @@ and optional Claude autofix PRs. Also configures Dependabot."
   git push -q -u origin "$BRANCH"
 
   gh pr create --repo "$OWNER/$REPO" \
+    --head "$BRANCH" \
     --base "$DEFAULT_BRANCH" \
     --title "Add security pipeline (OWASP scanning on every push)" \
     --body "Adds the caller workflow for the central [security-pipeline](https://github.com/$OWNER/security-pipeline): Semgrep (OWASP Top 10), Gitleaks secret scanning, Trivy dependency/IaC scanning, CodeQL on public repos, and optional Claude autofix PRs (enable by adding an \`ANTHROPIC_API_KEY\` secret). Also configures Dependabot for detected ecosystems." \
