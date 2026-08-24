@@ -1,0 +1,249 @@
+# Central reusable security pipeline — called by every repo.
+# Update this file once; every caller repo picks up the change.
+#
+# Layers:
+#   1. Semgrep  — SAST, OWASP Top 10 rulesets (all repos)
+#   2. Gitleaks — secret scanning, full git history (all repos)
+#   3. Trivy    — dependency vulns (SCA) + IaC misconfig (all repos)
+#   4. CodeQL   — deep semantic SAST (public repos only; needs GHAS on private)
+#   5. Claude autofix — if findings exist and ANTHROPIC_API_KEY secret is set,
+#      Claude proposes a fix in a pull request (never pushes to main)
+
+name: Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      strict:
+        description: "Fail the workflow when findings are detected"
+        type: boolean
+        default: false
+        required: false
+      autofix:
+        description: "Let Claude open a fix PR when findings are detected"
+        type: boolean
+        default: true
+        required: false
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+
+jobs:
+  semgrep:
+    name: Semgrep (SAST / OWASP Top 10)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    outputs:
+      findings: ${{ steps.count.outputs.findings }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep with OWASP rulesets
+        run: |
+          semgrep scan \
+            --config p/owasp-top-ten \
+            --config p/security-audit \
+            --config p/secrets \
+            --sarif-output=semgrep.sarif \
+            --metrics=off || true
+
+      - name: Count findings and write summary
+        id: count
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          with open("semgrep.sarif") as f:
+              sarif = json.load(f)
+          results = sarif["runs"][0]["results"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"findings={len(results)}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"## Semgrep (OWASP Top 10): {len(results)} finding(s)\n\n")
+              if results:
+                  s.write("| Severity | Rule | Location |\n|---|---|---|\n")
+                  for r in results[:50]:
+                      rule = r.get("ruleId", "?")
+                      sev = r.get("level", r.get("properties", {}).get("severity", "?"))
+                      loc = r["locations"][0]["physicalLocation"]
+                      path = loc["artifactLocation"]["uri"]
+                      line = loc.get("region", {}).get("startLine", "?")
+                      s.write(f"| {sev} | `{rule}` | `{path}:{line}` |\n")
+                  if len(results) > 50:
+                      s.write(f"\n…and {len(results) - 50} more.\n")
+          EOF
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+
+      - name: Upload to GitHub code scanning (public repos only)
+        if: ${{ !github.event.repository.private }}
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Enforce strict mode
+        if: ${{ inputs.strict && steps.count.outputs.findings != '0' }}
+        run: |
+          echo "::error::Semgrep found ${{ steps.count.outputs.findings }} issue(s) and strict mode is on."
+          exit 1
+
+  gitleaks:
+    name: Gitleaks (secret scanning)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  trivy:
+    name: Trivy (dependencies + IaC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan filesystem
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,misconfig
+          format: table
+          output: trivy.txt
+          exit-code: "0"
+
+      - name: Write summary
+        run: |
+          echo "## Trivy (dependencies + IaC)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          head -c 60000 trivy.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: SARIF for code scanning (public repos only)
+        if: ${{ !github.event.repository.private }}
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scanners: vuln,misconfig
+          format: sarif
+          output: trivy.sarif
+          exit-code: "0"
+
+      - name: Upload to GitHub code scanning (public repos only)
+        if: ${{ !github.event.repository.private }}
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  codeql-detect:
+    name: CodeQL language detection
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+    steps:
+      - name: Detect CodeQL-supported languages
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          langs=$(gh api "repos/${GITHUB_REPOSITORY}/languages" --jq 'keys[]' | while read -r l; do
+            case "$l" in
+              JavaScript|TypeScript|Astro) echo "javascript-typescript" ;;
+              Python) echo "python" ;;
+              Java|Kotlin) echo "java-kotlin" ;;
+              C|C++) echo "c-cpp" ;;
+              Go) echo "go" ;;
+              Ruby) echo "ruby" ;;
+              "C#") echo "csharp" ;;
+            esac
+          done | sort -u | jq -R . | jq -sc .)
+          echo "matrix=$langs" >> "$GITHUB_OUTPUT"
+          echo "Detected: $langs"
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    needs: codeql-detect
+    if: ${{ needs.codeql-detect.outputs.matrix != '[]' && needs.codeql-detect.outputs.matrix != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.codeql-detect.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql-${{ matrix.language }}
+
+  autofix:
+    name: Claude autofix (opens a PR)
+    needs: semgrep
+    if: ${{ inputs.autofix && needs.semgrep.outputs.findings != '0' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Check for ANTHROPIC_API_KEY
+        id: key
+        env:
+          KEY_PRESENT: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          echo "present=$KEY_PRESENT" >> "$GITHUB_OUTPUT"
+          if [ "$KEY_PRESENT" != "true" ]; then
+            echo "ANTHROPIC_API_KEY not set — skipping autofix. Add the secret to enable Claude fix PRs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'true'
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        if: steps.key.outputs.present == 'true'
+        with:
+          name: semgrep-sarif
+
+      - name: Claude fixes the findings
+        if: steps.key.outputs.present == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: |
+            You are running inside CI for ${{ github.repository }} on branch ${{ github.ref_name }}.
+            The file semgrep.sarif in the repo root contains security findings from Semgrep
+            (OWASP Top 10 rulesets). Your job:
+
+            1. Read semgrep.sarif and triage the findings. Ignore false positives; say why.
+            2. For real vulnerabilities, fix the code. Keep fixes minimal and idiomatic —
+               parameterized queries, output encoding, safe APIs, removing hardcoded secrets
+               (replace with env var reads and note what secret must be set).
+            3. Do NOT commit to ${{ github.ref_name }}. Create a branch named
+               security-autofix/${{ github.run_id }}, commit with clear messages,
+               push it, and open a pull request against ${{ github.ref_name }} using `gh pr create`.
+               The PR body must list each finding, whether you fixed or dismissed it, and why.
+            4. If every finding is a false positive, open no PR; print your triage instead.
+          claude_args: |
+            --allowedTools "Bash,Edit,Write,Read,Grep,Glob"
