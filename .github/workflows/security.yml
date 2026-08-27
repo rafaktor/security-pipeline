@@ -1,0 +1,20 @@
+# The pipeline scans itself with its own reusable workflow.
+name: Security
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write
+  actions: read
+  id-token: write
+
+jobs:
+  scan:
+    uses: rafaktor/security-pipeline/.github/workflows/security-scan.yml@main
+    secrets: inherit

@@ -1,0 +1,110 @@
+# Weekly fleet audit: verifies every repo is actually covered by the pipeline
+# and digests findings into one issue in this repo.
+#
+# Checks per repo:
+#   - caller workflow present (.github/workflows/security.yml)
+#   - latest Security run conclusion (flags startup failures = silent zero coverage)
+#   - Semgrep finding count from the latest run's SARIF artifact
+#   - open Dependabot PR count (backlog watch)
+#
+# Needs a FLEET_AUDIT_TOKEN secret: fine-grained PAT, all repos, with
+# Contents:read, Actions:read, Pull requests:read, Issues:read+write on this repo.
+# The default GITHUB_TOKEN only sees this repo, so it cannot audit the fleet.
+
+name: Fleet Audit
+
+on:
+  schedule:
+    - cron: "0 10 * * 1" # Mondays 10:00 UTC, after the 08:00 scans
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit fleet and build report
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_AUDIT_TOKEN || github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, urllib.request, zipfile, io
+
+          def gh(*args):
+              r = subprocess.run(["gh", "api"] + list(args), capture_output=True, text=True)
+              if r.returncode:
+                  return None
+              return json.loads(r.stdout)
+
+          owner = os.environ["OWNER"]
+          repos = gh("--paginate", f"users/{owner}/repos?per_page=100") or []
+          repos = [r for r in repos if not r["archived"] and not r["fork"]]
+          rows, problems = [], []
+
+          for r in sorted(repos, key=lambda x: x["name"].lower()):
+              name = r["name"]
+              full = r["full_name"]
+              covered = gh(f"repos/{full}/contents/.github/workflows/security.yml") is not None
+              runs = gh(f"repos/{full}/actions/workflows/security.yml/runs?per_page=1") if covered else None
+              last = (runs or {}).get("workflow_runs", [None])[0] if runs else None
+              concl = last["conclusion"] if last else "-"
+              when = last["created_at"][:10] if last else "-"
+
+              findings = "-"
+              if last and last.get("conclusion") == "success":
+                  arts = gh(f"repos/{full}/actions/runs/{last['id']}/artifacts") or {}
+                  art = next((a for a in arts.get("artifacts", []) if a["name"] == "semgrep-sarif"), None)
+                  if art:
+                      z = subprocess.run(
+                          ["gh", "api", f"repos/{full}/actions/artifacts/{art['id']}/zip"],
+                          capture_output=True)
+                      if z.returncode == 0:
+                          try:
+                              with zipfile.ZipFile(io.BytesIO(z.stdout)) as zf:
+                                  sarif = json.loads(zf.read("semgrep.sarif"))
+                              findings = len(sarif["runs"][0]["results"])
+                          except Exception:
+                              findings = "?"
+
+              prs = gh(f"search/issues?q=repo:{full}+is:pr+is:open+author:app/dependabot")
+              backlog = prs["total_count"] if prs else "?"
+
+              if not covered:
+                  problems.append(f"- **{name}**: no caller workflow — not scanned at all")
+              elif concl not in ("success", "-"):
+                  problems.append(f"- **{name}**: last Security run **{concl}** ({when})")
+              if isinstance(findings, int) and findings > 0:
+                  problems.append(f"- **{name}**: {findings} Semgrep finding(s)")
+              if isinstance(backlog, int) and backlog > 10:
+                  problems.append(f"- **{name}**: {backlog} open Dependabot PRs piling up")
+
+              rows.append(f"| {name} | {'✅' if covered else '❌'} | {concl} | {when} | {findings} | {backlog} |")
+
+          body = ["## Weekly security fleet report", ""]
+          if problems:
+              body += ["### ⚠️ Needs attention", ""] + problems + [""]
+          else:
+              body += ["Everything green. Nothing needs attention this week.", ""]
+          body += ["<details><summary>Full fleet table</summary>", "",
+                   "| Repo | Covered | Last run | When | Semgrep | Dependabot PRs |",
+                   "|---|---|---|---|---|---|"] + rows + ["", "</details>"]
+          with open("report.md", "w") as f:
+              f.write("\n".join(body) + "\n")
+          print("\n".join(body))
+          PY
+
+      - name: Create or update the report issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Weekly security fleet report"
+          NUM=$(gh issue list -R "$GITHUB_REPOSITORY" --search "in:title \"$TITLE\"" --state open --json number --jq '.[0].number')
+          if [ -n "$NUM" ]; then
+            gh issue edit "$NUM" -R "$GITHUB_REPOSITORY" --body-file report.md
+            gh issue comment "$NUM" -R "$GITHUB_REPOSITORY" --body "Updated $(date -u +%F). See issue body for the current state."
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body-file report.md
+          fi

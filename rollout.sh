@@ -29,22 +29,28 @@ for REPO in "$@"; do
   mkdir -p .github/workflows
   cp "$SCRIPT_DIR/templates/security.yml" .github/workflows/security.yml
 
-  # Build dependabot.yml from detected ecosystems
+  # Build dependabot.yml from detected ecosystems.
+  # Minor+patch bumps are grouped into one weekly PR per ecosystem; majors stay
+  # individual so breaking changes get their own review.
+  eco() { # eco <ecosystem> [limit]
+    printf "  - package-ecosystem: %s\n    directory: /\n    schedule: { interval: weekly }\n" "$1"
+    [ -n "${2:-}" ] && printf "    open-pull-requests-limit: %s\n" "$2"
+    printf "    groups:\n      %s-minor-patch:\n        applies-to: version-updates\n        update-types: [\"minor\", \"patch\"]\n" "$1"
+  }
   {
     echo "version: 2"
     echo "updates:"
-    echo "  - package-ecosystem: github-actions"
-    echo "    directory: /"
-    echo "    schedule: { interval: weekly }"
-    [ -f package.json ] && printf "  - package-ecosystem: npm\n    directory: /\n    schedule: { interval: weekly }\n    open-pull-requests-limit: 5\n"
-    { [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f Pipfile ]; } && printf "  - package-ecosystem: pip\n    directory: /\n    schedule: { interval: weekly }\n    open-pull-requests-limit: 5\n"
-    [ -f Cargo.toml ] && printf "  - package-ecosystem: cargo\n    directory: /\n    schedule: { interval: weekly }\n"
-    [ -f go.mod ] && printf "  - package-ecosystem: gomod\n    directory: /\n    schedule: { interval: weekly }\n"
-    [ -f pom.xml ] && printf "  - package-ecosystem: maven\n    directory: /\n    schedule: { interval: weekly }\n"
-    { [ -f build.gradle ] || [ -f build.gradle.kts ]; } && printf "  - package-ecosystem: gradle\n    directory: /\n    schedule: { interval: weekly }\n"
-    [ -f composer.json ] && printf "  - package-ecosystem: composer\n    directory: /\n    schedule: { interval: weekly }\n"
-    [ -f Package.swift ] && printf "  - package-ecosystem: swift\n    directory: /\n    schedule: { interval: weekly }\n"
-    [ -f Gemfile ] && printf "  - package-ecosystem: bundler\n    directory: /\n    schedule: { interval: weekly }\n"
+    eco github-actions
+    [ -f package.json ] && eco npm 5
+    { [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f Pipfile ]; } && eco pip 5
+    [ -f Cargo.toml ] && eco cargo
+    [ -f go.mod ] && eco gomod
+    [ -f pom.xml ] && eco maven
+    { [ -f build.gradle ] || [ -f build.gradle.kts ]; } && eco gradle
+    [ -f composer.json ] && eco composer
+    [ -f Package.swift ] && eco swift
+    [ -f Gemfile ] && eco bundler
+    true # keep set -e happy when the last test is false
   } > .github/dependabot.yml
 
   git checkout -b "$BRANCH"
