@@ -34,7 +34,8 @@ workflow run's **job summary** instead.
 jobs:
   scan:
     uses: rafaktor/security-pipeline/.github/workflows/security-scan.yml@main
-    secrets: inherit
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:
       strict: true    # fail the build on findings (default false)
       autofix: false  # disable Claude fix PRs (default true)

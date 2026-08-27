@@ -33,7 +33,7 @@ for REPO in "$@"; do
   # Minor+patch bumps are grouped into one weekly PR per ecosystem; majors stay
   # individual so breaking changes get their own review.
   eco() { # eco <ecosystem> [limit]
-    printf "  - package-ecosystem: %s\n    directory: /\n    schedule: { interval: weekly }\n" "$1"
+    printf "  - package-ecosystem: %s\n    directory: /\n    schedule: { interval: weekly }\n    cooldown: { default-days: 7 }\n" "$1"
     [ -n "${2:-}" ] && printf "    open-pull-requests-limit: %s\n" "$2"
     printf "    groups:\n      %s-minor-patch:\n        applies-to: version-updates\n        update-types: [\"minor\", \"patch\"]\n" "$1"
   }
