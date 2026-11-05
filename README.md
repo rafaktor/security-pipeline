@@ -37,7 +37,7 @@ jobs:
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:
-      strict: true    # fail the build on findings (default false)
+      strict: true    # fail on Semgrep findings and fixable CRITICAL/HIGH dependency CVEs (default false)
       autofix: false  # disable Claude fix PRs (default true)
 ```
 

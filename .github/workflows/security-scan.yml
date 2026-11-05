@@ -4,7 +4,8 @@
 # Layers:
 #   1. Semgrep  — SAST, OWASP Top 10 rulesets (all repos)
 #   2. Gitleaks — secret scanning, full git history (all repos)
-#   3. Trivy    — dependency vulns (SCA) + IaC misconfig (all repos)
+#   3. Trivy    — dependency vulns (SCA) + IaC misconfig (all repos); in strict
+#                 mode, fixable CRITICAL/HIGH CVEs fail the run
 #   4. CodeQL   — deep semantic SAST (public repos only; needs GHAS on private)
 #   5. Claude autofix — if findings exist and ANTHROPIC_API_KEY secret is set,
 #      Claude proposes a fix in a pull request (never pushes to main)
@@ -15,7 +16,7 @@ on:
   workflow_call:
     inputs:
       strict:
-        description: "Fail the workflow when findings are detected"
+        description: "Fail the workflow on Semgrep findings and on fixable CRITICAL/HIGH dependency CVEs (Trivy)"
         type: boolean
         default: false
         required: false
@@ -144,6 +145,21 @@ jobs:
         with:
           sarif_file: trivy.sarif
           category: trivy
+
+      # The scans above never fail (exit-code 0), so on its own Trivy only
+      # reports. In strict mode, a CRITICAL or HIGH dependency CVE that already
+      # has a fixed version fails the run; unfixable ones stay report-only, as
+      # there is nothing to upgrade to.
+      - name: Enforce strict mode (fixable CRITICAL/HIGH dependency CVEs)
+        if: ${{ inputs.strict }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
 
   codeql-detect:
     name: CodeQL language detection
